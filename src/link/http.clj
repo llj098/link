@@ -4,6 +4,8 @@
   (:use [clojure.string :only [lower-case]])
   (:use [clojure.java.io :only [input-stream copy]])
   (:require [link.threads :as threads])
+  (:require [clojure.core.async :as async
+             :refer [<! >! <!! timeout chan alt! go close!]])
   (:import [java.io File InputStream PrintStream])
   (:import [java.net InetSocketAddress])
   (:import [io.netty.buffer
@@ -91,9 +93,9 @@
                    buffer))
 
         netty-response (DefaultFullHttpResponse.
-                         HttpVersion/HTTP_1_1
-                         (HttpResponseStatus/valueOf status)
-                         content)
+                        HttpVersion/HTTP_1_1
+                        (HttpResponseStatus/valueOf status)
+                        content)
 
         netty-headers (.headers netty-response)]
 
@@ -107,35 +109,42 @@
 
     netty-response))
 
-(defn create-http-handler-from-ring [ring-fn debug]
+(defn create-http-handler-from-ring [ring-fn debug async]
   (create-handler
    (on-message [ch msg]
-               (let [req (ring-request ch msg)
-                     resp (ring-fn req)]
-                  (send ch (ring-response resp))))
+               (let [req (ring-request ch msg)]
+                 (if async
+                   (go
+                    (let [resp (<! (ring-fn req))]
+                      (send ch (ring-response resp))))
+                   (let [resp (ring-fn req)]
+                     (send ch (ring-response resp))))))
+
    (on-error [ch exc]
              (let [resp-buf (Unpooled/buffer)
                    resp-out (ByteBufOutputStream. resp-buf)
                    resp (DefaultFullHttpResponse.
-                          HttpVersion/HTTP_1_1
-                          HttpResponseStatus/INTERNAL_SERVER_ERROR
-                          resp-buf)]
+                         HttpVersion/HTTP_1_1
+                         HttpResponseStatus/INTERNAL_SERVER_ERROR
+                         resp-buf)]
                (if debug
                  (.printStackTrace exc (PrintStream. resp-out))
                  (.writeBytes resp-buf (.getBytes "Internal Error" "UTF-8")))
 
                (send ch resp)))))
 
+
 (defn http-server [port ring-fn
                    & {:keys [threads executor debug host
-                             ssl-context max-request-body]
+                             ssl-context max-request-body async]
                       :or {threads 0
                            executor nil
                            debug false
                            host "0.0.0.0"
-                           max-request-body 1048576}}]
+                           max-request-body 1048576
+                           async false}}]
   (let [executor (if threads (threads/new-executor threads) executor)
-        ring-handler (create-http-handler-from-ring ring-fn debug)
+        ring-handler (create-http-handler-from-ring ring-fn debug async)
         handlers [#(HttpRequestDecoder.)
                   #(HttpObjectAggregator. max-request-body)
                   #(HttpResponseEncoder.)
