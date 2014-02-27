@@ -109,6 +109,18 @@
 
     netty-response))
 
+(defn- http-on-error [ch exc debug]
+  (let [resp-buf (Unpooled/buffer)
+        resp-out (ByteBufOutputStream. resp-buf)
+        resp (DefaultFullHttpResponse.
+              HttpVersion/HTTP_1_1
+              HttpResponseStatus/INTERNAL_SERVER_ERROR
+              resp-buf)]
+    (if debug
+      (.printStackTrace exc (PrintStream. resp-out))
+      (.writeBytes resp-buf (.getBytes "Internal Error" "UTF-8")))
+    (send ch resp)))
+
 (defn create-http-handler-from-ring [ring-fn debug async]
   (create-handler
    (on-message [ch msg]
@@ -116,23 +128,13 @@
                  (if async
                    (go
                     (let [resp (<! (ring-fn req))]
-                      (send ch (ring-response resp))))
+                      (if (instance? Exception resp)
+                        (http-on-error ch resp debug)
+                        (send ch (ring-response resp)))))
                    (let [resp (ring-fn req)]
                      (send ch (ring-response resp))))))
-
    (on-error [ch exc]
-             (let [resp-buf (Unpooled/buffer)
-                   resp-out (ByteBufOutputStream. resp-buf)
-                   resp (DefaultFullHttpResponse.
-                         HttpVersion/HTTP_1_1
-                         HttpResponseStatus/INTERNAL_SERVER_ERROR
-                         resp-buf)]
-               (if debug
-                 (.printStackTrace exc (PrintStream. resp-out))
-                 (.writeBytes resp-buf (.getBytes "Internal Error" "UTF-8")))
-
-               (send ch resp)))))
-
+             (http-on-error ch exc debug))))
 
 (defn http-server [port ring-fn
                    & {:keys [threads executor debug host
