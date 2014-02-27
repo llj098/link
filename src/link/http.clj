@@ -4,8 +4,6 @@
   (:use [clojure.string :only [lower-case]])
   (:use [clojure.java.io :only [input-stream copy]])
   (:require [link.threads :as threads])
-  (:require [clojure.core.async :as async
-             :refer [<! >! <!! timeout chan alt! go close!]])
   (:import [java.io File InputStream PrintStream])
   (:import [java.net InetSocketAddress])
   (:import [io.netty.buffer
@@ -23,7 +21,9 @@
             HttpObjectAggregator
             HttpResponseEncoder
             HttpResponseStatus
-            DefaultFullHttpResponse]))
+            DefaultFullHttpResponse])
+  (:import [clojure.lang APersistentMap]))
+
 
 (defn- as-map [headers]
   (apply hash-map
@@ -109,7 +109,7 @@
 
     netty-response))
 
-(defn- http-on-error [ch exc debug]
+(defn http-on-error [ch exc debug]
   (let [resp-buf (Unpooled/buffer)
         resp-out (ByteBufOutputStream. resp-buf)
         resp (DefaultFullHttpResponse.
@@ -119,26 +119,30 @@
     (if debug
       (.printStackTrace exc (PrintStream. resp-out))
       (.writeBytes resp-buf (.getBytes "Internal Error" "UTF-8")))
-    (send ch resp)))
+    (send ch resp)
+    (close ch)))
 
-(defn create-http-handler-from-ring [ring-fn debug async]
+(defprotocol ResponseHandle
+  (http-handle [req resp ch]))
+
+(extend-protocol ResponseHandle
+  APersistentMap
+  (http-handle [_ resp ch]
+               (send ch (ring-response resp))))
+
+(defn create-http-handler-from-ring [ring-fn debug]
   (create-handler
    (on-message [ch msg]
-               (let [req (ring-request ch msg)]
-                 (if async
-                   (go
-                    (let [resp (<! (ring-fn req))]
-                      (if (instance? Exception resp)
-                        (http-on-error ch resp debug)
-                        (send ch (ring-response resp)))))
-                   (let [resp (ring-fn req)]
-                     (send ch (ring-response resp))))))
+               (let [req (ring-request ch msg)
+                     resp (ring-fn req)]
+                 (http-handle req resp ch)))
+
    (on-error [ch exc]
              (http-on-error ch exc debug))))
 
 (defn http-server [port ring-fn
                    & {:keys [threads executor debug host
-                             ssl-context max-request-body async]
+                             ssl-context max-request-body]
                       :or {threads 0
                            executor nil
                            debug false
@@ -146,7 +150,7 @@
                            max-request-body 1048576
                            async false}}]
   (let [executor (if threads (threads/new-executor threads) executor)
-        ring-handler (create-http-handler-from-ring ring-fn debug async)
+        ring-handler (create-http-handler-from-ring ring-fn debug)
         handlers [#(HttpRequestDecoder.)
                   #(HttpObjectAggregator. max-request-body)
                   #(HttpResponseEncoder.)
